@@ -1,0 +1,7 @@
+node_modules/
+config.json
+crash.log
+crash.log.old
+disconnects.log
+learned.json
+.env
