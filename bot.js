@@ -811,26 +811,9 @@ function createBotInner() {
     return true;
   }
   async function flyNow() {
-    if (!(await wearElytra())) { say("I don't have an elytra."); return; }
-    if (!instance.entity.onGround) return;
-    elytraRestore = true;
-    try {
-      instance.setControlState('jump', true);
-      await sleep(150);
-      instance.setControlState('jump', false);
-      await sleep(450);
-      await instance.elytraFly();
-      const rocket = instance.inventory.items().find((i) => i.name === 'firework_rocket');
-      if (rocket) {
-        await withInv(() => instance.equip(rocket, 'hand'));
-        instance.look(instance.entity.yaw, 0.4);
-        instance.activateItem();
-      }
-      // combat.js lands the bot safely once it is gliding with nothing to do (see landSafely)
-    } catch (e) {
-      instance.setControlState('jump', false);
-      say(`Could not take off: ${e.message}`);
-    }
+    const r = await combat.flyUp();
+    if (!r.ok) say(`Could not take off: ${r.why}`.slice(0, 200));
+    // combat.js lands the bot safely once it is gliding with nothing to do (see landSafely)
   }
   async function equipChestplateNow() {
     elytraWorn = false;

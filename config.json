@@ -118,5 +118,9 @@
     "autoSleep": true,
     "openDoors": true
   },
-  "parkour": false
+  "parkour": false,
+  "runFirst": true,
+  "runFirstMs": 3500,
+  "airstrikeFarDist": 38,
+  "takeoffMode": "doublejump"
 }

@@ -83,3 +83,12 @@ god (default, adaptive) | mace | spear | sword | axe
 - Normal chat from the owner goes to the AI brain: it answers like a player (same language) AND acts ("come", "kill X", "build a shelter" ...).
   Without an AI key simple phrases still work (come here / aa ja / follow me / stop / sleep ...).
 - `help` is whispered to the person who typed it and lists every command.
+
+## Ground take-off (double jump + rocket), run first, wind reset
+- Take-off now works the way a player does it: rocket in hand, running jump, press jump again in the air (elytra opens), rocket at once.
+  The wind-charge launch is only the backup. The `fly` command uses the same routine (combat.flyUp).
+- If a flight does not work the reason is stored and shown by `godcheck` ("Last flight problem: ...": roof above, no elytra, server did not
+  start gliding ...). A failed take-off pauses air strikes for 15 s instead of retrying every tick.
+- RUN FIRST: when hunting a player the bot runs at them and only takes off if running does not close the gap (3.5 s, <4 blocks gained)
+  or the target is farther than 38 blocks. config: runFirst, runFirstMs, airstrikeFarDist.
+- New technique `windreset` (momentum breaking): wind charge angled at the feet when falling / dashing fast, then back to a weapon.

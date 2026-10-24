@@ -126,7 +126,7 @@ function createCombat(bot, ctx) {
   const opts = { air: !!cfg.airstrike, wind: !!cfg.windSmash, pearl: !!cfg.pearl };
   // God-style tricks (all on by default; "trick <name> off" turns one off)
   const tricks = { dive: true, grapple: true, windpearl: true, stunslam: true, backstab: true, lungeswap: true, attrswap: true, dtap: true,
-    reachglitch: true, lungedash: true, elyloop: true, pearlrocket: true, countergrapple: true, offtap: true, greset: true };
+    reachglitch: true, windreset: true, lungedash: true, elyloop: true, pearlrocket: true, countergrapple: true, offtap: true, greset: true };
   if (cfg.tricks) Object.assign(tricks, cfg.tricks);
   for (const k of disabledStunts) opts[k] = false;
   const markStunt = (kind) => { lastStunt = { kind, at: Date.now() }; };
@@ -183,6 +183,9 @@ function createCombat(bot, ctx) {
   let openerUntil = 0;
   let openerCd = 0;
   let flightFails = 0;
+  let flightWhy = '';             // last reason a flight did not work (shown by godcheck)
+  let lastWindReset = 0;
+  let runUp = { on: false, since: 0, d0: 0 };
   let landing = false;
   let stabSent = 0;             // stabs sent since the last confirmed hit
   let stabOffSession = false;   // stab packets don't seem to land on this server: use normal attacks
@@ -799,8 +802,8 @@ function createCombat(bot, ctx) {
     if (flightFails >= 3 && opts.air) {
       opts.air = false;
       flightFails = 0;
-      log('elytra take-off keeps failing - elytra flights OFF for now'); rep('E303');
-      if (ctx.say) ctx.say('Elytra take-off keeps failing, so I turned elytra flights OFF. (type "air on" to try again)');
+      log('elytra take-off keeps failing - elytra flights OFF for now:', flightWhy); rep('E303', null, flightWhy);
+      if (ctx.say) ctx.say(`Elytra take-off keeps failing (${flightWhy || 'unknown'}), so I turned elytra flights OFF. (type "air on" to try again)`.slice(0, 220));
     }
   }
   /**
@@ -837,11 +840,48 @@ function createCombat(bot, ctx) {
     }
   }
 
-  /** Leave the ground (wind-charge launch if we have one, else a jump) and start gliding. */
+  /**
+   * The way a player does it: jump, press jump AGAIN in the air (= elytra opens), rocket at once.
+   * The rocket is already in the hand before the jump so the boost is instant after the elytra opens.
+   */
+  async function doubleJumpTakeoff(token, yaw) {
+    const e = bot.entity;
+    if (!skyOpen(3)) { flightWhy = 'a roof is right above me (need open sky to take off)'; return false; }
+    const r = rocket();
+    if (r) await hold(r);
+    bot.look(yaw, 0.35, true);
+    drive({ forward: true, sprint: true });                         // running jump: more height + speed
+    await bot.waitForTicks(2);
+    bot.setControlState('jump', true);                              // 1st jump
+    await bot.waitForTicks(2);
+    bot.setControlState('jump', false);
+    if (!(await waitUntil(() => !e.onGround, 8, token))) { flightWhy = 'I could not jump'; drive({}); return false; }
+    await bot.waitForTicks(2);                                      // the short gap of a real double tap
+    let lastErr = '';
+    for (let i = 0; i < 6 && token === gen && !e.elytraFlying && !e.onGround; i++) {
+      try { await bot.elytraFly(); } catch (err) { lastErr = err.message; }       // 2nd jump = open the elytra
+      if (await waitUntil(() => e.elytraFlying, 4, token)) break;
+    }
+    drive({});
+    if (!e.elytraFlying) { flightWhy = lastErr || 'the server did not open the elytra (not worn / broken / flying blocked)'; return false; }
+    if (r) bot.activateItem();                                      // rocket right away
+    await bot.waitForTicks(1);
+    return true;
+  }
+
+  /** Leave the ground and start gliding: double-jump first, wind-charge launch as the backup. */
   async function takeoff(token, yaw) {
     const e = bot.entity;
+    flightWhy = '';
     if (e.elytraFlying) return true;
-    if (e.isInWater || e.isInLava) return false;
+    if (e.isInWater || e.isInLava) { flightWhy = 'I am in water / lava'; return false; }
+    if (e.onGround && cfg.takeoffMode !== 'wind') {
+      if (await doubleJumpTakeoff(token, yaw)) { flightFails = 0; log('take-off: double jump + rocket'); return true; }
+      if (token !== gen) return false;
+      log(`double-jump take-off failed (${flightWhy})`);
+      if (/roof/.test(flightWhy)) return false;                    // nothing else will work under a roof
+      await waitUntil(() => e.onGround, 40, token);               // land again before trying the wind launch
+    }
     if (e.onGround && cfg.windTakeoff && findByName('wind_charge') && skyOpen(8)) {
       drive({ forward: true, sprint: true });
       await windLaunch(token, yaw);
@@ -852,11 +892,12 @@ function createCombat(bot, ctx) {
       await bot.waitForTicks(2);
       bot.setControlState('jump', false);
     }
-    if (!(await waitUntil(() => !e.onGround && e.velocity.y < -0.05, 45, token))) { log('could not leave the ground'); return false; }
+    if (!(await waitUntil(() => !e.onGround && e.velocity.y < -0.05, 45, token))) { flightWhy = flightWhy || 'could not leave the ground'; log('could not leave the ground'); return false; }
     bot.look(yaw, 0.1, true);                                // level out (the wind launch left us looking straight down)
     try {
       await bot.elytraFly();
     } catch (err) {
+      flightWhy = err.message;
       log('elytraFly failed:', err.message); rep('E300', err);
       return false;
     }
@@ -864,12 +905,27 @@ function createCombat(bot, ctx) {
     if (!(await waitUntil(() => e.elytraFlying, 12, token))) {
       try { if (!e.onGround) await bot.elytraFly(); } catch (err) { /* ignore */ }
       if (!(await waitUntil(() => e.elytraFlying, 14, token))) {
+        flightWhy = 'the server did not start gliding (elytra broken or not worn?)';
         log('server did not start gliding (elytra broken or not worn?)');
         return false;
       }
     }
     flightFails = 0;
     return true;
+  }
+
+  /** "fly" command / anything that just wants to be in the air: wear elytra, double-jump, rocket. */
+  async function flyUp(yaw) {
+    if (busy || !bot.entity) return { ok: false, why: 'busy' };
+    const token = gen;
+    busy = 'fly';
+    try {
+      if (!(await ctx.elytra.wear())) return { ok: false, why: "I don't have an elytra" };
+      ctx.elytra.setRestore(true);
+      if (!rocket()) return { ok: false, why: 'I have no firework rockets' };
+      const ok = await takeoff(token, yaw === undefined ? bot.entity.yaw : yaw);
+      return ok ? { ok: true } : { ok: false, why: flightWhy || 'take-off failed' };
+    } finally { busy = null; }
   }
 
   /** Climb with rockets until we are `height` blocks above y (steering toward fx,fz). */
@@ -896,10 +952,10 @@ function createCombat(bot, ctx) {
       ctx.pathStop();
       const dist0 = e.position.distanceTo(target.position);
       log(`airstrike (${kind}) starting, target ${Math.round(dist0)} blocks away`);
-      if (!(await ctx.elytra.wear())) { log('airstrike aborted: no elytra'); return; }
+      if (!(await ctx.elytra.wear())) { flightWhy = 'no elytra'; log('airstrike aborted: no elytra'); return; }
       ctx.elytra.setRestore(true);
-      if (!rocket()) { log('airstrike aborted: no firework rockets'); return; }
-      if (!(await takeoff(token, headingToTarget()))) { log('airstrike aborted: takeoff failed'); noteFlightFail(); return; }
+      if (!rocket()) { flightWhy = 'no firework rockets'; log('airstrike aborted: no firework rockets'); return; }
+      if (!(await takeoff(token, headingToTarget()))) { log('airstrike aborted: takeoff failed -', flightWhy); noteFlightFail(); airBlockedUntil = now() + 15000; return; }
 
       // climb only as high as the distance needs (short swoop up close, big dive from far away)
       const climb = clamp(dist0 * 0.6, 9, cfg.climbHeight);
@@ -1519,6 +1575,23 @@ function createCombat(bot, ctx) {
     }
   }
 
+  // ---- momentum breaking / wind resetting: wind charge angled at the feet cancels a fast fall or dash and sets up the next strike ----
+  async function windReset() {
+    lastWindReset = now();
+    const wind = findByName('wind_charge');
+    if (!wind) return;
+    try {
+      const yaw = valid(target) ? yawTo(target) : bot.entity.yaw;
+      await hold(wind);
+      bot.look(yaw, -1.2, true);                              // slightly angled, not straight down: keeps some forward speed
+      bot.activateItem();
+      log('wind reset: wind charge at my feet (momentum broken)');
+      await bot.waitForTicks(2);
+      const w = findWeapon('mace') || findWeapon('spear') || findWeapon('sword');
+      if (w) await hold(w);                                  // back to a weapon to re-engage
+    } catch (err) { rep('E341', err, 'windReset'); }
+  }
+
   // ---- 8) Spear-mace d-tap: spear in the OFF-hand pops the totem, mace on the same tick kills ----
   let offPrev;                       // name of the item that was in the off-hand (restored afterwards)
   let offtapActive = false;
@@ -1722,6 +1795,7 @@ function createCombat(bot, ctx) {
     if (flightFails) why.push(`${flightFails} recent take-off failures`);
     if (disabledStunts.size) why.push(`disabled by learning: ${[...disabledStunts].join(',')} (delete learned.json)`);
     if (aggr() === 'cautious') why.push('brain says CAUTIOUS (odds are bad): no stunts');
+    if (flightWhy) lines.push(`Last flight problem: ${flightWhy}`);
     const ts = Object.entries(tstat).map(([k, v]) => `${k} ${v.hits}/${v.uses}`).join(' ');
     if (ts) lines.push(`Technique hits/uses: ${ts}`);
     lines.push(`Style ${weaponPref === 'smart' ? 'auto' : weaponPref} | aggression ${aggr()} | blockers: ${why.join('; ') || 'none - ready'}`);
@@ -1791,6 +1865,13 @@ function createCombat(bot, ctx) {
       }
     }
 
+    // 7) momentum breaking: falling / dashing fast toward the ground -> wind charge at my feet, then re-engage
+    if (god && tricks.windreset && !e.onGround && !e.elytraFlying && e.velocity.y < -0.9 && t - lastWindReset > 1500 && countOf('wind_charge') > 0 &&
+        groundDistance(10) <= 7 && !e.isInWater) {
+      windReset();
+      return;
+    }
+
     // 6) stun slam A: a falling mace smash into a raised shield disables it
     if (god && blocking && tricks.stunslam && opts.wind && e.onGround && has('mace') && findByName('wind_charge') && canStunt() &&
         t > windBlockedUntil && hdist >= 3 && hdist <= 9 && t - lastWindSmash > 4000 && bot.health >= 12 && skyOpen(11)) {
@@ -1817,8 +1898,18 @@ function createCombat(bot, ctx) {
       return;
     }
 
+    // RUN FIRST: like a real player the bot runs at the target and only takes off when running does not work
+    // (target far away, running away, or no way to get closer). "runFirst": false in config.json = fly at once.
+    let allowAir = true;
+    if (cfg.runFirst !== false && e.onGround && dist > airMin && dist <= (cfg.airstrikeFarDist || 38)) {
+      if (!runUp.on) runUp = { on: true, since: t, d0: dist };
+      const gained = runUp.d0 - dist;
+      allowAir = (t - runUp.since > (cfg.runFirstMs || 3500)) && gained < 4;     // running for 3.5 s did not close the gap
+    } else if (dist <= airMin) runUp.on = false;
+    else if (dist > (cfg.airstrikeFarDist || 38)) runUp.on = false;
+
     // 1) elytra airstrike / divebomb: only on a player that is really far away, and not while it keeps missing
-    if (!dtap && stuntTarget && canStunt() && opts.air && tricks.dive && dist > airMin && t > airBlockedUntil && !e.isInWater) {
+    if (allowAir && !dtap && stuntTarget && canStunt() && opts.air && tricks.dive && dist > airMin && t > airBlockedUntil && !e.isInWater) {
       const kind = airKind();
       if (kind && (findByName('elytra') || ctx.elytra.isWorn()) && countOf('firework_rocket') >= 2 && skyOpen()) {
         airstrike(kind);
@@ -2139,6 +2230,8 @@ function createCombat(bot, ctx) {
     travel,
     pearlItem,
     windLaunchOut,
+    flyUp,
+    flightProblem: () => flightWhy,
     waterEscape,
     lungeEscape,
     techStats: () => tstat,
