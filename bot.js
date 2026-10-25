@@ -14,6 +14,7 @@ const llm = require('./llm');
 const crypto = require('crypto');
 const compat = require('./compat');
 const createSurvival = require('./survival');
+const createNav = require('./nav');
 const createFirebase = require('./firebase');
 
 const defaults = {
@@ -397,6 +398,7 @@ function createBotInner() {
   function setMode(m) {
     mode = m;
     killSpec = null;
+    if (nav) nav.reset();
     combat.disengage();
     clearGoal();
     clearControls();
@@ -484,12 +486,14 @@ function createBotInner() {
     return Number.isFinite(v.x + v.y + v.z) ? v : null;
   }
 
+  let gotoDest = null;
   let comeName = null;
   let comeStart = 0;
   let comePos = null;
   let comeLastLocate = 0;
   let comeLocating = false;
   let comeNoDestSince = 0;
+  let comeEscaped = false;
   let pathFails = 0;
   let travelFailedAt = 0;
   let arrivedSince = 0;
@@ -542,23 +546,14 @@ function createBotInner() {
     const dh = Math.hypot(dest.x - me.x, dest.z - me.z);
     if (ent && me.distanceTo(ent.position) <= 4) { clearGoal(); setMode('afk'); return; }     // arrived
     if (!ent && dh < 5) { clearGoal(); return; }                                              // at the last known spot, waiting for a location update
-    if (!travelling && dh > 60 && Date.now() - travelFailedAt > 8000) {
-      travelling = true;
-      combat.travel(dest, () => mode !== 'come' || !!(findPlayer(name) && findPlayer(name).entity && findPlayer(name).entity.position.distanceTo(instance.entity.position) < 40))
-        .then((how) => { if (!how) travelFailedAt = Date.now(); })
-        .catch(() => { travelFailedAt = Date.now(); })
-        .finally(() => { travelling = false; });
+    // the navigator plans the route (fly when far, walk otherwise), watches progress and un-sticks itself
+    const liveDest = () => { const p = findPlayer(name); return (p && p.entity) ? p.entity.position : (comePos || lastSeen[name]); };
+    const res = nav.step(dest, { key: 'come', range: 2, follow: ent || null, destFn: liveDest, tpName: name, abort: () => mode !== 'come' });
+    if (res === 'failed') {
+      if (!comeEscaped) { comeEscaped = true; nav.reset(); escapeSys.escape('terrain').catch(() => {}); return; }
+      say("I can't find a way to you. Come closer, or give me OP so I can teleport.");
+      setMode('afk');
     }
-    if (travelling) return;
-    if (pathFails >= 6 && !opDenied && cfg.returnTpFallback !== false) {                      // cannot walk there: teleport as the last resort
-      pathFails = 0;
-      say('Teleporting to you.');
-      sendLine(`/tp ${instance.username} ${name}`);
-      return;
-    }
-    if (pathFails >= 4) { pathFails = 0; clearGoal(); escapeSys.escape('terrain').catch(() => {}); return; }
-    if (ent && dh <= 48) setGoalOnce(`c${ent.id}`, () => new goals.GoalFollow(ent, 2), true);   // run after you (sprints automatically)
-    else setGoalOnce(`c${Math.round(dest.x / 4)}_${Math.round(dest.z / 4)}_${Math.round(me.x / 24)}_${Math.round(me.z / 24)}`, () => legGoal(dest));
   }
 
   // ---------- water rescue (after a wind / elytra landing in water the bot used to float there doing nothing) ----------
@@ -618,26 +613,11 @@ function createBotInner() {
     }
     arrivedSince = 0;
 
-    // 3) long distance: elytra / pearl (never retried more than once per 8 s)
-    if (!travelling && dh > 60 && Date.now() - travelFailedAt > 8000) {
-      travelling = true;
-      combat.travel(dest, () => mode !== 'kill' || !!(instance.players[name] && instance.players[name].entity))
-        .then((how) => { if (!how) travelFailedAt = Date.now(); })
-        .catch(() => { travelFailedAt = Date.now(); })
-        .finally(() => { travelling = false; });
-    }
-    if (travelling) return;
-
-    // 4) walk there in legs of at most ~48 blocks
-    if (pathFails >= 4) {                           // the pathfinder keeps failing: wiggle out, then try again
-      pathFails = 0;
-      errs.report('E401');
-      clearGoal();
-      escapeSys.escape('terrain').catch(() => {});
-      return;
-    }
-    const bucket = `${Math.round(dest.x / 4)}_${Math.round(dest.z / 4)}_${Math.round(me.x / 24)}_${Math.round(me.z / 24)}`;
-    setGoalOnce(`hunt${bucket}`, () => legGoal(dest));
+    // 3) the navigator plans the route (elytra when far, walking legs otherwise), detects "stuck" and recovers
+    const liveDest = () => huntPos || lastSeen[name];
+    const res = nav.step(dest, { key: 'hunt', range: 4, destFn: liveDest, tpName: name,
+      abort: () => mode !== 'kill' || !!(instance.players[name] && instance.players[name].entity) });
+    if (res === 'failed') giveUpHunt(`I can't find a way to ${name}. Stopping the hunt.`, 'E401');
   }
 
   function modeTick() {
@@ -695,6 +675,12 @@ function createBotInner() {
         break;
       }
       case 'come': comeTick(); break;
+      case 'goto': {
+        if (!gotoDest) { setMode('afk'); break; }
+        const r = nav.step(gotoDest, { key: 'goto', range: 1.5, tpName: null });
+        if (r === 'arrived') { say('Arrived.'); setMode('afk'); } else if (r === 'failed') { say("Can't find a way there."); setMode('afk'); }
+        break;
+      }
       case 'follow': {
         const p = instance.players[followName];
         if (p && p.entity) setGoalOnce(`f${p.entity.id}`, () => new goals.GoalFollow(p.entity, 2), true);
@@ -891,6 +877,7 @@ function createBotInner() {
   });
 
   let survival = null;
+  let nav = null;
   // ---------- builder + brain ----------
   function walkTo(pos, range = 3) {
     return new Promise((resolve) => {
@@ -941,13 +928,21 @@ function createBotInner() {
     locked: lockedNow
   });
   instance.on('physicsTick', () => { try { survival.stepTick(); } catch (e) { /* never break physics */ } });
+  nav = createNav(instance, {
+    cfg, combat, builder,
+    think: (t) => brain.think(t),
+    countOf: (n) => instance.inventory.items().filter((i) => i.name === n).reduce((a, i) => a + i.count, 0),
+    canFly: () => combat.canFly(),
+    opDenied: () => opDenied,
+    tp: (d, name) => sendLine(name ? `/tp ${instance.username} ${name}` : `/tp ${instance.username} ${d.x.toFixed(1)} ${d.y.toFixed(1)} ${d.z.toFixed(1)}`),
+    report: errs.report
+  });
 
 
   function escapeIntent() {
     if (mode === 'idle' || combat.isBusy() || eating) return 'none';
     if (mode === 'afk') return 'none';
-    if (mode === 'goto') return instance.pathfinder.goal ? 'moving' : 'none';
-    if (mode === 'come') return travelling || !instance.pathfinder.goal ? 'none' : 'moving';
+    if (mode === 'goto' || mode === 'come') return 'none';       // the navigator (nav.js) watches progress itself
     if (mode === 'follow') {
       const p = instance.players[followName];
       return p && p.entity && p.entity.position.distanceTo(instance.entity.position) > 6 ? 'moving' : 'none';
@@ -1336,7 +1331,7 @@ function createBotInner() {
       const v = (args[0] || '').toLowerCase();
       if (v === 'on' || v === 'off') { brain.setEnabled(v === 'on'); return say(`Tactical brain ${v.toUpperCase()}.`); }
       const a = brain.assessNow();
-      say(`${brain.status()} | now: ${a.text}`.slice(0, 230));
+      say(`${brain.status()} | ${nav.status()} | now: ${a.text}`.slice(0, 230));
     },
     sleep() { survival.goSleep(true).then((r) => { if (r === 'sleeping') say('Going to bed.'); else if (r !== 'nobed') say(`Can't sleep: ${r}`.slice(0, 200)); }).catch(() => {}); },
     autosleep(args) { const v = (args[0] || '').toLowerCase(); cfg.survival = { ...(cfg.survival || {}), autoSleep: v !== 'off' }; say(`Auto-sleep ${v === 'off' ? 'OFF' : 'ON'}. ${survival.status()}`); },
@@ -1422,6 +1417,7 @@ function createBotInner() {
       comeStart = Date.now();
       comePos = null;
       comeNoDestSince = 0;
+      comeEscaped = false;
       dimChecked = false;
       pathFails = 0;
       travelFailedAt = 0;
@@ -1432,10 +1428,8 @@ function createBotInner() {
       const [x, y, z] = args.map(Number);
       if ([x, y, z].some((n) => Number.isNaN(n))) return say('Usage: goto <x> <y> <z>');
       setMode('goto');
+      gotoDest = new Vec3(x, y, z);
       say(`Going to ${x} ${y} ${z}...`);
-      instance.pathfinder.goto(new goals.GoalNear(x, y, z, 1))
-        .then(() => { if (mode === 'goto') { say('Arrived.'); setMode('afk'); } })
-        .catch((e) => { if (mode === 'goto') { say(`Can't get there: ${e.message}`); setMode('afk'); } });
     },
     weapon(args) {
       const w = (args[0] || '').toLowerCase();

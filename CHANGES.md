@@ -92,3 +92,11 @@ god (default, adaptive) | mace | spear | sword | axe
 - RUN FIRST: when hunting a player the bot runs at them and only takes off if running does not close the gap (3.5 s, <4 blocks gained)
   or the target is farther than 38 blocks. config: runFirst, runFirstMs, airstrikeFarDist.
 - New technique `windreset` (momentum breaking): wind charge angled at the feet when falling / dashing fast, then back to a weapon.
+
+## Navigation brain (nav.js) + flying to the right place
+- Flying: the destination is now LIVE (follows the moving owner/target instead of a stale point), the flight plans a route over the
+  terrain (samples the ground ahead, climbs over hills, detours around mountains too tall to climb), and the final glide steers
+  ONTO the destination and lands next to it (before, it glided straight ahead and landed wherever it pointed).
+- nav.js: every trip (come / kill-hunt / goto) is planned and supervised: fly when far, otherwise a walking route; if there is no
+  progress it escalates automatically: jump+sidestep -> a different route -> tower / bridge with blocks -> wind-charge hop -> ender pearl
+  -> elytra hop -> /tp (OP) -> polite give-up. `brain` shows the navigator status, `think` shows its decisions.

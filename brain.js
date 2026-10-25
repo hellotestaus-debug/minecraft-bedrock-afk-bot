@@ -394,7 +394,7 @@ Keep "say" under 140 characters, plain text.`;
   }
 
   return {
-    tick, autoTick, shouldAvoid, plan, flee,
+    tick, autoTick, shouldAvoid, plan, flee, think,
     noteDamage: (src) => { if (src && src.type === 'player' && src.username) attackers.set(src.username, now()); },
     isFleeing: () => fleeing,
     // all-in when we are clearly stronger (more stunts, shorter cooldowns), cautious when odds are bad (melee only)

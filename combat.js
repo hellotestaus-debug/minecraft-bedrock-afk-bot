@@ -812,20 +812,29 @@ function createCombat(bot, ctx) {
    * Without this the bot keeps gliding in a straight line at full speed: crash damage, hovering over the void,
    * or an anti-fly kick.
    */
-  async function landSafely(why) {
+  let landHint = null;            // function returning where the last flight was heading
+  let landHintAt = 0;
+  async function landSafely(why, destFn) {
     if (landing || !bot.entity || !bot.entity.elytraFlying) return;
     landing = true;
     const e = bot.entity;
-    log(`gliding with nothing to do - landing safely${why ? ` (${why})` : ''}`);
+    log(`gliding with nothing to do - landing safely${why ? ` (${why})` : ''}${destFn ? ' near the destination' : ''}`);
     try {
       const t0 = now();
-      const yaw = e.yaw;
-      while (e.elytraFlying && bot.entity && now() - t0 < 30000) {
+      let yaw = e.yaw;
+      while (e.elytraFlying && bot.entity && now() - t0 < 40000) {
         const gd = groundDistance(60);
         const speed = e.velocity.norm() * 20;
         const vy = e.velocity.y;
+        const dest = destFn ? destFn() : null;
+        let hd = null;
+        if (dest) {
+          hd = Math.hypot(dest.x - e.position.x, dest.z - e.position.z);
+          yaw = Math.atan2(-(dest.x - e.position.x), -(dest.z - e.position.z));       // keep steering to the destination
+        }
         let pitch = -0.12;                                   // gentle glide
-        if (gd > 30) pitch = -0.5;                           // lose altitude faster
+        if (dest && hd > 8 && gd > 10) pitch = -clamp(Math.atan2(gd - 4, hd) * 1.2, 0.1, 0.55);    // arrive on top of the target
+        else if (gd > 30) pitch = -0.5;                      // lose altitude faster
         else if (gd > 14) pitch = -0.25;
         if (gd <= 12 && (vy < -0.55 || speed > 22)) pitch = 0.45;    // flare: bleed off speed
         if (gd <= 4 && vy < -0.3) pitch = 0.6;
@@ -837,6 +846,7 @@ function createCombat(bot, ctx) {
       log('landing error:', err.message); rep('E302', err);
     } finally {
       landing = false;
+      landHint = null;
     }
   }
 
@@ -1063,30 +1073,76 @@ function createCombat(bot, ctx) {
     return passes;
   }
 
-  // ---------- long-distance travel (used when hunting a player far away) ----------
-  async function elytraTravel(pos, shouldAbort) {
+  // ---------- long-distance travel (used when hunting a player far away / coming to the owner) ----------
+  /** Highest solid (or leaf / water) block at x,z; null when the chunk is not loaded. */
+  function surfaceY(x, z) {
+    const top = Math.min(319, Math.floor(bot.entity.position.y) + 100);
+    for (let y = top; y > -64; y--) {
+      const b = bot.blockAt(new Vec3(Math.floor(x), y, Math.floor(z)));
+      if (!b) return null;
+      if (b.boundingBox === 'block' || /leaves|water/.test(b.name)) return y;
+    }
+    return -64;
+  }
+  /** Highest terrain along a ray of `len` blocks in direction yaw (samples every 8 blocks, 3 wide). */
+  function ridgeAlong(from, yaw, len) {
+    let max = -64;
+    for (let d = 8; d <= len; d += 8) {
+      for (const side of [-3, 0, 3]) {
+        const x = from.x - Math.sin(yaw) * d + Math.cos(yaw) * side;
+        const z = from.z - Math.cos(yaw) * d - Math.sin(yaw) * side;
+        const y = surfaceY(x, z);
+        if (y !== null && y > max) max = y;
+      }
+    }
+    return max;
+  }
+  /** The route "in the bot's head": straight if the terrain can be climbed over, otherwise the lowest pass within +-60 degrees. */
+  function planHeading(from, dest, altNow) {
+    const direct = Math.atan2(-(dest.x - from.x), -(dest.z - from.z));
+    const len = Math.min(80, Math.hypot(dest.x - from.x, dest.z - from.z));
+    const base = ridgeAlong(from, direct, len);
+    if (base + 14 <= altNow + 40) return { yaw: direct, ridge: base };         // a few rockets get us over it
+    let best = { yaw: direct, ridge: base };
+    for (const off of [0.35, -0.35, 0.7, -0.7, 1.05, -1.05]) {
+      const r = ridgeAlong(from, direct + off, len);
+      if (r + 10 < best.ridge - 8) best = { yaw: direct + off, ridge: r };
+    }
+    return best;
+  }
+
+  /** destArg: a position OR a function returning the CURRENT destination (the owner keeps moving). */
+  async function elytraTravel(destArg, shouldAbort) {
     if (busy) return false;
+    const destFn = typeof destArg === 'function' ? destArg : () => destArg;
     const token = gen;
     busy = 'travel';
     markStunt('air');
     const e = bot.entity;
     try {
-      if (!(await ctx.elytra.wear())) return false;
+      if (!(await ctx.elytra.wear())) { flightWhy = 'no elytra'; return false; }
       ctx.elytra.setRestore(true);
-      const yawToPos = () => Math.atan2(-(pos.x - e.position.x), -(pos.z - e.position.z));
+      const first = destFn();
+      if (!first) return false;
+      const yawToPos = () => { const p = destFn() || first; return Math.atan2(-(p.x - e.position.x), -(p.z - e.position.z)); };
       if (!(await takeoff(token, yawToPos()))) { noteFlightFail(); return false; }
-      log(`flying toward ${Math.round(pos.x)} ${Math.round(pos.z)}`);
+      log(`flying toward ${Math.round(first.x)} ${Math.round(first.z)}`);
       const t0 = now();
       let lastBoost = 0;
       let used = 0;
-      while (token === gen && now() - t0 < 75000 && e.elytraFlying) {
+      let route = { yaw: yawToPos(), ridge: -64 };
+      let routeAt = 0;
+      while (token === gen && now() - t0 < 90000 && e.elytraFlying) {
         if (shouldAbort && shouldAbort()) break;
         if (bot.health < 8) break;                                  // too hurt for fancy flying: land
+        const pos = destFn();                                       // live destination: follows a moving player
+        if (!pos) break;
         const hd = Math.hypot(pos.x - e.position.x, pos.z - e.position.z);
-        if (hd < 28) break;                                         // close enough: landSafely() takes over
+        if (hd < 24) break;                                         // close enough: landSafely() steers the descent onto the target
         const speed = e.velocity.norm() * 20;
-        // cruise high, come down gradually as we get close
-        const wantAlt = pos.y + clamp(hd * 0.3, 10, 55);
+        if (now() - routeAt > 1200) { route = planHeading(e.position, pos, e.position.y); routeAt = now(); }     // re-plan about once a second
+        // cruise high enough for the terrain ahead, come down gradually near the destination
+        const wantAlt = Math.max(route.ridge + 14, pos.y + clamp(hd * 0.3, 10, 55));
         let pitch = clamp((wantAlt - e.position.y) * 0.03, -0.45, 0.5);
         if (groundDistance(40) < 8 && e.velocity.y < -0.3) pitch = 0.6;     // pull up
         if (obstacleAhead(16)) pitch = 0.7;                                  // mountain / wall ahead
@@ -1095,18 +1151,50 @@ function createCombat(bot, ctx) {
           used++;
           await boost(token);
         }
-        bot.look(yawToPos(), pitch, true);
+        bot.look(route.yaw, pitch, true);
         await bot.waitForTicks(1);
       }
+      landHint = destFn;                                            // land ON the destination, not wherever the last heading ends
+      landHintAt = now();
       return true;
     } catch (err) {
-      log('travel error:', err.message); rep('E301', err);
+      log('travel error:', err.message);
+      rep('E301', err);
       noteFlightFail();
       return false;
     } finally {
       busy = null;
       drive({});
     }
+  }
+
+  /** Teleport pearl toward a spot (used by the navigator when the ground route is blocked). */
+  async function pearlToward(dest) {
+    if (busy || !opts.pearl || !pearlItem() || now() - lastPearl < 4000 || bot.health < 10) return false;
+    const e = bot.entity;
+    const d = Math.hypot(dest.x - e.position.x, dest.z - e.position.z);
+    if (d < 6) return false;
+    const k = Math.min(d, 40) / d;
+    const spot = new Vec3(e.position.x + (dest.x - e.position.x) * k, typeof dest.y === 'number' ? dest.y : e.position.y, e.position.z + (dest.z - e.position.z) * k);
+    busy = 'pearl';
+    markStunt('pearl');
+    try { return !!(await throwPearlAt(spot, gen)); } finally { busy = null; }
+  }
+
+  async function travel(destArg, shouldAbort, o = {}) {
+    const destFn = typeof destArg === 'function' ? destArg : () => destArg;
+    const pos = destFn();
+    if (!pos) return null;
+    const e = bot.entity;
+    const d = Math.hypot(pos.x - e.position.x, pos.z - e.position.z);
+    if (busy || ctx.isEating()) return null;
+    if (d > (o.minDist || 70) && opts.air && (findByName('elytra') || ctx.elytra.isWorn()) && countOf('firework_rocket') >= 3 && skyOpen()) {
+      return (await elytraTravel(destFn, shouldAbort)) ? 'elytra' : null;
+    }
+    if (d > 45 && opts.pearl && pearlItem() && now() - lastPearl > 4000 && bot.health >= 12) {
+      if (await pearlToward(pos)) { log(`pearl toward the destination (${Math.round(d)} blocks)`); return 'pearl'; }
+    }
+    return null;
   }
 
   // ---------- ender pearls ----------
@@ -2049,7 +2137,7 @@ function createCombat(bot, ctx) {
         ctx.elytra.putChestplate().catch(() => {});
       }
       // gliding with nothing steering us: land safely instead of flying on at full speed
-      if (e.elytraFlying && !busy && !landing && !clutching) { landSafely(); return; }
+      if (e.elytraFlying && !busy && !landing && !clutching) { landSafely('idle glide', landHint && now() - landHintAt < 10000 ? landHint : null); return; }
       if (!target) return;
       if (!valid(target)) { target = null; return; }
       trackTarget();
@@ -2199,26 +2287,6 @@ function createCombat(bot, ctx) {
   }
 
   /** Cross a long distance: elytra flight if possible, else a pearl toward the point. Returns the method used or null. */
-  async function travel(pos, shouldAbort) {
-    const e = bot.entity;
-    const d = Math.hypot(pos.x - e.position.x, pos.z - e.position.z);
-    if (busy || ctx.isEating()) return null;
-    if (d > 70 && opts.air && (findByName('elytra') || ctx.elytra.isWorn()) && countOf('firework_rocket') >= 3 && skyOpen()) {
-      return (await elytraTravel(pos, shouldAbort)) ? 'elytra' : null;
-    }
-    if (d > 45 && opts.pearl && pearlItem() && now() - lastPearl > 4000 && bot.health >= 12) {
-      const k = Math.min(d, 44) / d;
-      const spot = new Vec3(e.position.x + (pos.x - e.position.x) * k, e.position.y, e.position.z + (pos.z - e.position.z) * k);
-      busy = 'pearl';
-      markStunt('pearl');
-      try {
-        const sol = await throwPearlAt(spot, gen);
-        if (sol) { log(`pearl toward hunted player (${Math.round(d)} blocks)`); return 'pearl'; }
-      } finally { busy = null; }
-    }
-    return null;
-  }
-
   return {
     engage,
     disengage,
@@ -2228,6 +2296,8 @@ function createCombat(bot, ctx) {
     loadout,
     noteKick,
     travel,
+    pearlToward,
+    canFly: () => !!(opts.air && (findByName('elytra') || ctx.elytra.isWorn()) && countOf('firework_rocket') >= 3 && skyOpen()),
     pearlItem,
     windLaunchOut,
     flyUp,
