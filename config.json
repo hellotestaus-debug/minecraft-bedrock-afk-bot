@@ -61,7 +61,7 @@
   "aiChat": {
     "enabled": true,
     "provider": "gemini",
-    "apiKey": "AQ.Ab8RN6JAK2M3PHuK2VmLrhmembz6vwPJ6rNsT-5hNlgFO6LXRw",
+    "apiKey": "AQ.Ab8RN6JsAv3V7fFIoQL3qwnOY2bRXDhzYg2GPbDI6XVgMIuHMQ",
     "model": "gemini-2.5-flash"
   },
   "escapeTpToOwner": true,
